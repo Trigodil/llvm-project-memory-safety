@@ -264,6 +264,9 @@ public:
       case diag::warn_use_in_invalid_state:
         Override.enableConsumedAnalysis = true;
         break;
+      case diag::warn_refcell_borrow_conflict:
+        Override.enableRefCellBorrowCheck = true;
+        break;
       }
     }
   }

@@ -54,6 +54,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -2323,6 +2324,183 @@ class ThreadSafetyReporter : public clang::threadSafety::ThreadSafetyHandler {
 } // namespace threadSafety
 } // namespace clang
 
+// -Wrefcell-borrow: CFG dataflow tracking live Ref/RefMut guards per RefCell,
+// flagging a borrow that overlaps a live conflicting guard on the same cell.
+// Unlike -Wthread-safety's held/not-held model, two shared borrows are allowed.
+namespace clang {
+namespace refcellborrow {
+namespace {
+
+bool isRecordNamed(QualType T, StringRef Name) {
+  T = T.getNonReferenceType().getUnqualifiedType();
+  if (const CXXRecordDecl *RD = T->getAsCXXRecordDecl())
+    return RD->getQualifiedNameAsString() == Name;
+  return false;
+}
+
+bool isGuardType(QualType T) {
+  return isRecordNamed(T, "safecpp::Ref") ||
+         isRecordNamed(T, "safecpp::RefMut");
+}
+
+bool isExclusiveGuardType(QualType T) {
+  return isRecordNamed(T, "safecpp::RefMut");
+}
+
+struct GuardInfo {
+  const VarDecl *Cell;
+  bool Exclusive;
+};
+
+// Peels copy-elision and temporary wrappers down to the borrow() or
+// borrow_mut() call that initializes a guard variable.
+const CXXMemberCallExpr *extractBorrowCall(const Expr *E) {
+  E = E->IgnoreParenImpCasts();
+  for (;;) {
+    const Expr *Prev = E;
+    if (const auto *EWC = dyn_cast<ExprWithCleanups>(E)) {
+      E = EWC->getSubExpr();
+    } else if (const auto *CE = dyn_cast<CXXConstructExpr>(E)) {
+      if (CE->getNumArgs() == 1)
+        E = CE->getArg(0);
+    } else if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(E)) {
+      E = MTE->getSubExpr();
+    } else if (const auto *BTE = dyn_cast<CXXBindTemporaryExpr>(E)) {
+      E = BTE->getSubExpr();
+    }
+    E = E->IgnoreParenImpCasts();
+    if (E == Prev)
+      break;
+  }
+  if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(E)) {
+    if (const CXXMethodDecl *MD = MCE->getMethodDecl()) {
+      if (MD->getIdentifier() &&
+          (MD->getName() == "borrow" || MD->getName() == "borrow_mut"))
+        return MCE;
+    }
+  }
+  return nullptr;
+}
+
+using LiveGuardSet = llvm::SmallPtrSet<const VarDecl *, 4>;
+using GuardMap = llvm::DenseMap<const VarDecl *, GuardInfo>;
+
+class GuardCollector : public DynamicRecursiveASTVisitor {
+public:
+  GuardMap &Guards;
+  explicit GuardCollector(GuardMap &Guards) : Guards(Guards) {}
+
+  bool VisitVarDecl(VarDecl *VD) override {
+    if (!VD->hasInit() || !isGuardType(VD->getType()))
+      return true;
+    const CXXMemberCallExpr *MCE = extractBorrowCall(VD->getInit());
+    if (!MCE)
+      return true;
+    if (const Expr *Obj = MCE->getImplicitObjectArgument()) {
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(Obj->IgnoreParenImpCasts()))
+        if (const auto *CellVD = dyn_cast<VarDecl>(DRE->getDecl()))
+          Guards[VD] = GuardInfo{CellVD, isExclusiveGuardType(VD->getType())};
+    }
+    return true;
+  }
+};
+
+class RefCellBorrowChecker {
+public:
+  RefCellBorrowChecker(Sema &S, AnalysisDeclContext &AC) : S(S), AC(AC) {}
+
+  void run() {
+    CFG *Cfg = AC.getCFG();
+    Stmt *Body = AC.getBody();
+    if (!Cfg || !Body)
+      return;
+    GuardCollector Collector(Guards);
+    Collector.TraverseStmt(Body);
+    if (Guards.empty())
+      return;
+
+    unsigned N = Cfg->getNumBlockIDs();
+    std::vector<LiveGuardSet> InState(N), OutState(N);
+    std::vector<bool> Visited(N, false), Queued(N, false);
+    std::deque<const CFGBlock *> Worklist;
+
+    const CFGBlock *Entry = &Cfg->getEntry();
+    Worklist.push_back(Entry);
+    Queued[Entry->getBlockID()] = true;
+
+    while (!Worklist.empty()) {
+      const CFGBlock *B = Worklist.front();
+      Worklist.pop_front();
+      unsigned ID = B->getBlockID();
+      Queued[ID] = false;
+
+      LiveGuardSet NewIn;
+      for (const CFGBlock *Pred : B->preds())
+        if (Pred)
+          NewIn.insert_range(OutState[Pred->getBlockID()]);
+
+      // Also process on first visit, where an empty join would otherwise
+      // look unchanged and skip the successors.
+      if (Visited[ID] && NewIn == InState[ID])
+        continue;
+      Visited[ID] = true;
+      InState[ID] = NewIn;
+      OutState[ID] = simulate(B, NewIn, /*Emit=*/false);
+      for (const CFGBlock *Succ : B->succs()) {
+        if (Succ && !Queued[Succ->getBlockID()]) {
+          Worklist.push_back(Succ);
+          Queued[Succ->getBlockID()] = true;
+        }
+      }
+    }
+
+    for (const CFGBlock *B : *Cfg)
+      simulate(B, InState[B->getBlockID()], /*Emit=*/true);
+  }
+
+private:
+  Sema &S;
+  AnalysisDeclContext &AC;
+  GuardMap Guards;
+
+  bool conflicts(const GuardInfo &New, const LiveGuardSet &Live) const {
+    for (const VarDecl *L : Live) {
+      auto It = Guards.find(L);
+      if (It != Guards.end() && It->second.Cell == New.Cell &&
+          (New.Exclusive || It->second.Exclusive))
+        return true;
+    }
+    return false;
+  }
+
+  LiveGuardSet simulate(const CFGBlock *B, LiveGuardSet State, bool Emit) {
+    for (const CFGElement &Elem : *B) {
+      if (auto CS = Elem.getAs<CFGStmt>()) {
+        const auto *DS = dyn_cast<DeclStmt>(CS->getStmt());
+        if (!DS)
+          continue;
+        for (const Decl *D : DS->decls()) {
+          const auto *GVD = dyn_cast<VarDecl>(D);
+          auto It = GVD ? Guards.find(GVD) : Guards.end();
+          if (It == Guards.end())
+            continue;
+          if (Emit && conflicts(It->second, State))
+            S.Diag(GVD->getLocation(), diag::warn_refcell_borrow_conflict)
+                << It->second.Cell;
+          State.insert(GVD);
+        }
+      } else if (auto Dtor = Elem.getAs<CFGAutomaticObjDtor>()) {
+        State.erase(Dtor->getVarDecl());
+      }
+    }
+    return State;
+  }
+};
+
+} // namespace
+} // namespace refcellborrow
+} // namespace clang
+
 //===----------------------------------------------------------------------===//
 // -Wconsumed
 //===----------------------------------------------------------------------===//
@@ -2785,6 +2963,7 @@ sema::AnalysisBasedWarnings::Policy::Policy() {
   enableCheckUnreachable = 0;
   enableThreadSafetyAnalysis = 0;
   enableConsumedAnalysis = 0;
+  enableRefCellBorrowCheck = 0;
 }
 
 /// InterProceduralData aims to be a storage of whatever data should be passed
@@ -2846,6 +3025,7 @@ sema::AnalysisBasedWarnings::getPolicyInEffectAt(SourceLocation Loc) {
       P.enableThreadSafetyAnalysis |=
           PolicyOverrides.enableThreadSafetyAnalysis;
       P.enableConsumedAnalysis |= PolicyOverrides.enableConsumedAnalysis;
+      P.enableRefCellBorrowCheck |= PolicyOverrides.enableRefCellBorrowCheck;
       return P;
     }
   }
@@ -2862,12 +3042,16 @@ sema::AnalysisBasedWarnings::getPolicyInEffectAt(SourceLocation Loc) {
 
   P.enableConsumedAnalysis = areAnyEnabled(D, Loc, warn_use_in_invalid_state);
 
+  P.enableRefCellBorrowCheck =
+      areAnyEnabled(D, Loc, warn_refcell_borrow_conflict);
+
   if (Cacheable)
     PolicyCache[SysIdx][StateKey] = P;
 
   P.enableCheckUnreachable |= PolicyOverrides.enableCheckUnreachable;
   P.enableThreadSafetyAnalysis |= PolicyOverrides.enableThreadSafetyAnalysis;
   P.enableConsumedAnalysis |= PolicyOverrides.enableConsumedAnalysis;
+  P.enableRefCellBorrowCheck |= PolicyOverrides.enableRefCellBorrowCheck;
   return P;
 }
 
@@ -2880,6 +3064,7 @@ void sema::AnalysisBasedWarnings::clearOverrides() {
   PolicyOverrides.enableCheckUnreachable = false;
   PolicyOverrides.enableConsumedAnalysis = false;
   PolicyOverrides.enableThreadSafetyAnalysis = false;
+  PolicyOverrides.enableRefCellBorrowCheck = false;
 }
 
 static void flushDiagnostics(Sema &S, const sema::FunctionScopeInfo *fscope) {
@@ -3208,7 +3393,8 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   // expect to always be CFGElements and then fill in the BuildOptions
   // appropriately.  This is essentially a layering violation.
   if (P.enableCheckUnreachable || P.enableThreadSafetyAnalysis ||
-      P.enableConsumedAnalysis || EnableLifetimeSafetyAnalysis) {
+      P.enableConsumedAnalysis || P.enableRefCellBorrowCheck ||
+      EnableLifetimeSafetyAnalysis) {
     // Unreachable code analysis and thread safety require a linearized CFG.
     AC.getCFGBuildOptions().setAllAlwaysAdd();
   } else {
@@ -3282,6 +3468,12 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     consumed::ConsumedWarningsHandler WarningHandler(S);
     consumed::ConsumedAnalyzer Analyzer(WarningHandler);
     Analyzer.run(AC);
+  }
+
+  // Check for safecpp::RefCell borrow-exclusivity violations.
+  if (P.enableRefCellBorrowCheck) {
+    refcellborrow::RefCellBorrowChecker Checker(S, AC);
+    Checker.run();
   }
 
   if (!Diags.isIgnored(diag::warn_uninit_var, D->getBeginLoc()) ||

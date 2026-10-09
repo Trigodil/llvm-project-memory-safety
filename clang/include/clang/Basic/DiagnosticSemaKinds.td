@@ -4536,6 +4536,11 @@ def note_guarded_by_declared_here : Note<"guarded_by declared here">;
 def warn_thread_safety_beta : Warning<"thread safety beta warning">,
   InGroup<ThreadSafetyBeta>, DefaultIgnore;
 
+// safecpp::RefCell borrow exclusivity.
+def warn_refcell_borrow_conflict : Warning<
+  "borrow of RefCell %0 conflicts with a borrow that is still alive">,
+  InGroup<RefCellBorrow>, DefaultIgnore;
+
 // Consumed warnings
 def warn_use_in_invalid_state : Warning<
   "invalid invocation of method '%0' on object '%1' while it is in the '%2' "
