@@ -42,3 +42,22 @@ chat](https://discord.gg/xS7Z362),
 
 The LLVM project has adopted a [code of conduct](https://llvm.org/docs/CodeOfConduct.html) for
 participants to all modes of communication within the project.
+
+## Memory-safety fork: `-Wrefcell-borrow`
+
+This fork adds a Clang warning that enforces Rust's borrow rule for
+safecpp's `RefCell<T>`: many
+readers or one writer.
+
+```cpp
+safecpp::RefCell<int> cell(1);
+auto r = cell.borrow();
+auto m = cell.borrow_mut(); // warning: borrow of RefCell 'cell' conflicts
+                            // with a borrow that is still alive
+```
+
+The warning is off by default. Enable it with `-Wrefcell-borrow`, or use
+`-Werror=refcell-borrow` to make it an error. Multiple `borrow()` calls can be
+live together, and a borrow ends when its guard goes out of scope. The check
+lives in `clang/lib/Sema/AnalysisBasedWarnings.cpp`, with tests in
+`clang/test/SemaCXX/warn-refcell-borrow.cpp`.
